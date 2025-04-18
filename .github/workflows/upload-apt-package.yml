@@ -1,15 +1,16 @@
 name: Upload APT package to Azure storage account
 
-on: 
-workflow_dispatch:
-  inputs:
-    package_version:
-      description: 'Package version (leave empty to use latest)'
-      required: false
-      default: ''
-schedule:
-  # Run at 8 AM UTC (9 AM BST) every day
-  - cron: '0 8 * * *'
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: 'Package version (leave empty to use latest)'
+        required: false
+        default: ''
+  
+  schedule:
+    # Run at 8 AM UTC (9 AM BST) every day
+    - cron: '0 8 * * *'
 
 jobs:
   get-latest-version:
@@ -233,27 +234,3 @@ jobs:
           echo "Package version: ${{ env.PACKAGE_VERSION }}"
           echo "Container name: ${{ steps.container-name.outputs.container_name }}"
           echo "Container URL: https://${{ env.AZURE_STORAGE_ACCOUNT }}.blob.core.windows.net/${{ steps.container-name.outputs.container_name }}"
-
-
-
-
-
-  
-
-
-
-
-
-
-
-  
-        
-      
-
-
-
-
-
-
-
-
