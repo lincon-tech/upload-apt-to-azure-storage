@@ -1,0 +1,174 @@
+
+name: Upload APT package to Azure storage account
+
+on:
+  workflow_dispatch:
+    inputs:
+        package_version:
+            description: 'Package version'
+            required: true
+            default: '10.0.0.922'
+
+jobs:
+  upload-repo:
+    runs-on: windows-latest
+
+    env:
+      AZURE_STORAGE_ACCOUNT: ospupdatesnonprod
+      AZURE_STORAGE_KEY: ${{ secrets.STORAGE_ACCOUNT_KEY }}
+      SHAREPOINT_USERNAME: ${{ secrets.SHAREPOINT_USERNAME }}
+      SHAREPOINT_PASSWORD: ${{ secrets.SHAREPOINT_PASSWORD }}
+      PACKAGE_VERSION: ${{inputs.package_version}}   
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Azure CLI
+      uses: azure/setup-azure@v3
+      with:
+        version: latest
+
+    - name: Generate Random UUID
+      id: get-uuid
+      run: echo "uuid=$(uuidgen)" >> $GITHUB_OUTPUT
+
+    - name: Storage container name construct
+      id: container-name
+      run: |
+        $version=($PACKAGE_VERSION) -replace "\.","-"
+        $container_name="osp-repo-${version}-${{ steps.get-uuid.outputs.uuid }}"
+        echo "container_name=$container_name" >> $GITHUB_OUTPUT
+
+    - name: Create Storage container
+      run: |
+        az storage container create --name ${{ steps.container-name.outputs.container_name }} --account-name $AZURE_STORAGE_ACCOUNT --account-key $AZURE_STORAGE_KEY --public-access blob
+
+    - name: Download CSOM DLLs
+      run: |
+        Invoke-WebRequest https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile .\nuget.exe
+        .\nuget.exe install Microsoft.SharePointOnline.CSOM -OutputDirectory .\csom
+
+        $csomPath = Get-ChildItem -Path ".\csom" -Filter "Microsoft.SharePointOnline.CSOM.*" | Select-Object -First 1
+
+    - name: Copy CSOM DLLs
+      run: |
+        Copy-Item "csom\Microsoft.SharePointOnline.CSOM\*\lib\net45\*.dll" -Destination "." -Recurse -Force
+
+    - name: Download files from sharepoint
+      shell: pwsh
+      run: |
+        #Load SharePoint CSOM Assemblies
+        #Add-Type -Path "C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\16\ISAPI\Microsoft.SharePoint.Client.dll"
+        #Add-Type -Path "C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\16\ISAPI\Microsoft.SharePoint.Client.Runtime.dll"
+        
+        Add-Type -Path "$($csomPath.FullName)\lib\net45\Microsoft.SharePoint.Client.dll"
+        Add-Type -Path "$($csomPath.FullName)\lib\net45\Microsoft.SharePoint.Client.Runtime.dll"
+        
+        Function Download-SPOFolder()
+        { 
+            param
+            (
+                [Parameter(Mandatory=$true)] [string] $SiteURL,
+                [Parameter(Mandatory=$true)] [Microsoft.SharePoint.Client.Folder] $SourceFolder,
+                [Parameter(Mandatory=$true)] [string] $TargetFolder
+            )
+            Try {
+                
+                #Create Local Folder, if it doesn't exist
+                $FolderName = ($SourceFolder.ServerRelativeURL) -replace "/","\"
+                $LocalFolder = $TargetFolder+"\${PACKAGE_VERSION}"
+                If (!(Test-Path -Path $LocalFolder)) {
+                        New-Item -ItemType Directory -Path $LocalFolder | Out-Null
+                }
+                
+                #Get all Files from the folder
+                $FilesColl = $SourceFolder.Files
+                $Ctx.Load($FilesColl)
+                $Ctx.ExecuteQuery()
+        
+                #Iterate through each file and download
+                Foreach($File in $FilesColl)
+                {
+                    $TargetFile = $LocalFolder+"\"+$FolderName
+                    #Download the file
+                    $FileInfo = [Microsoft.SharePoint.Client.File]::OpenBinaryDirect($Ctx,$File.ServerRelativeURL)
+                    $WriteStream = [System.IO.File]::Open($TargetFile,[System.IO.FileMode]::Create)
+                    $FileInfo.Stream.CopyTo($WriteStream)
+                    $WriteStream.Close()
+                    write-host -f Green "Downloaded File:"$TargetFile
+                }
+                
+                #Process Sub Folders
+                $SubFolders = $SourceFolder.Folders
+                $Ctx.Load($SubFolders)
+                $Ctx.ExecuteQuery()
+                Foreach($Folder in $SubFolders)
+                {
+                    If($Folder.Name -ne "Forms")
+                    {
+                        #Call the function recursively
+                        Download-SPOFolder -SiteURL $SiteURL -SourceFolder $Folder -TargetFolder $TargetFolder
+                    }
+                }
+            }
+            Catch {
+                write-host -foregroundcolor Red "Error Downloading Folder!" $_.Exception.Message
+            }
+        }
+
+        #Set parameter values
+        $SiteURL="https://apps.jci.com/sites/1VMSEngineering"
+        $FolderRelativeUrl ="Shared Documents/OSP-Repo/${PACKAGE_VERSION}"
+        $TargetFolder="C:\Temp"
+        
+        #Setup Credentials to connect
+        $username=$SHAREPOINT_USERNAME
+        $password=$SHAREPOINT_PASSWORD
+        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+        $Credentials = New-Object Microsoft.SharePoint.Client.SharePointOnlineCredentials($username, $securePassword)
+        
+        #Setup the context
+        $Ctx = New-Object Microsoft.SharePoint.Client.ClientContext($SiteURL)
+        $Ctx.Credentials = $Credentials
+        
+        #Get the Web
+        $Web = $Ctx.Web
+        $Ctx.Load($Web)
+        $Ctx.ExecuteQuery()
+        $Web.ServerRelativeUrl+$FolderRelativeUrl
+            
+        #Get the Folder
+        $SourceFolder = $Web.GetFolderByServerRelativeUrl($Web.ServerRelativeUrl+$FolderRelativeUrl)
+        $Ctx.Load($SourceFolder)
+        $Ctx.ExecuteQuery()
+        
+        #Call the function to download a Folder
+        Download-SPOFolder -SiteURL $SiteURL -SourceFolder $SourceFolder -TargetFolder $TargetFolder
+
+    - name: Extract tar file
+      run: |
+        tar -xf C:\Temp\${PACKAGE_VERSION}\osp-repo-${PACKAGE_VERSION}.tar -C C:\Temp\${PACKAGE_VERSION}\
+
+    - name: Read content of GPG and json file into variable
+      run: |
+        export REPO_GPG=$(< C:\Temp\${PACKAGE_VERSION}\repo.gpg)
+        export REPO_JSON=$(< C:\Temp\${PACKAGE_VERSION}\repo.json)
+        echo "REPO_GPG=$REPO_GPG" >> $GITHUB_ENV
+        echo "REPO_JSON=$REPO_JSON" >> $GITHUB_ENV
+
+    - name: Delete GPG and json file
+      run: |
+        #Delete GPG and json file from tree
+        rm -rf C:\Temp\${PACKAGE_VERSION}\osp-repo\repo.gpg
+        rm -rf C:\Temp\${PACKAGE_VERSION}\osp-repo\repo.json
+
+    - name: Upload files to blob container
+      run: |
+        az storage blob upload-batch --destination ${{ steps.container-name.outputs.container_name }} --account-name $AZURE_STORAGE_ACCOUNT --account-key $AZURE_STORAGE_KEY --source C:\Temp\${PACKAGE_VERSION}\osp-repo\ --output none
+
+        echo "Uploaded files:"
+        for file in $(find ./my-folder -type f); do
+        blob_name=${file#./my-folder/}
+        echo "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/${blob_name}"
+        done
