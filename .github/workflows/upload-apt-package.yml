@@ -6,7 +6,7 @@ workflow_dispatch:
     package_version:
       description: 'Package version (leave empty to use latest)'
       required: false
-      default: '''
+      default: ''
 schedule:
   # Run at 8 AM UTC (9 AM BST) every day
   - cron: '0 8 * * *'
